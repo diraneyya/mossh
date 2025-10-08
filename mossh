@@ -83,38 +83,51 @@ if [[ -z "$REMOTE_JUMP_SSH_NAME" ]]; then
 fi
 
 # Remote functions
-function install_mosh() {
+function plan_mosh_install() {
     if command -v mosh-server >/dev/null 2>&1; then
         return 0
     fi
 
     if command -v apt-get >/dev/null 2>&1; then
-        sudo apt-get update && sudo apt-get install -y mosh
+        INSTALL_COMMAND='sudo -n apt-get update && sudo -n apt-get install -y mosh'
     elif command -v yum >/dev/null 2>&1; then
-        sudo yum install -y mosh
+        INSTALL_COMMAND='sudo -n yum install -y mosh'
     elif command -v dnf >/dev/null 2>&1; then
-        sudo dnf install -y mosh
+        INSTALL_COMMAND='sudo -n dnf install -y mosh'
     elif command -v pacman >/dev/null 2>&1; then
-        sudo pacman -S --noconfirm mosh
+        INSTALL_COMMAND='sudo -n pacman -S --noconfirm mosh'
     elif command -v brew >/dev/null 2>&1; then
-        brew install mosh
+        INSTALL_COMMAND='brew install mosh'
+    # OpenWRT
+    elif command -v opkg >/dev/null 2>&1; then
+        INSTALL_COMMAND='opkg update && opkg install mosh-server'
     else
-        echo "Error: could not install mosh on the remote" >&2
+        echo "No package manager(s) found $1"
         return 1
     fi
+    echo "$INSTALL_COMMAND"
+    return 0
 }
 
-function execute_on_the_remote() {
-    if [[ ${1@L} == 'ssh' ]]; then
-        if [[ $# -eq 1 || -z "${*:2}" ]]; then 
-            exec /usr/bin/env bash -l
+# This function should run on sh, ash, bash, and zsh
+execute_on_the_remote() {
+    if [ "$1" = "ssh" ]; then
+        # Check if only one argument
+        if [ $# -eq 1 ]; then 
+            if [ -n "$SHELL" ]; then 
+                "$SHELL" -l
+            else 
+                sh -l
+            fi
         else 
             ssh_output_file=$(mktemp)
-            if ssh -T "${@:2}" true &>"$ssh_output_file"; then
+            # Shift past first argument to get remaining args
+            shift
+            if ssh -T "$@" true 2>"$ssh_output_file"; then
                 rm "$ssh_output_file"
-                exec ssh "${@:2}"
+                exec ssh "$@"
             else 
-                echo "Error: jumping via _ssh ${*:2}_ failed: $(cat "$ssh_output_file")" >&2
+                echo "Error: jumping via \"ssh $*\" failed: $(cat "$ssh_output_file")" >&2
                 rm "$ssh_output_file"
                 exit 1
             fi
@@ -130,9 +143,9 @@ REMOTE_JUMP_SSH_HOST=$(ssh -G "$REMOTE_JUMP_SSH_NAME" | awk '/^hostname / {print
 REMOTE_JUMP_SSH_PORT=$(ssh -G "$REMOTE_JUMP_SSH_NAME" | awk '/^port / {print $2; exit}')
 REMOTE_JUMP_SSH_USER=$(ssh -G "$REMOTE_JUMP_SSH_NAME" | awk '/^user / {print $2; exit}')
 
-if [[ "$REMOTE_JUMP_SSH_USER" == "$USER" ]]; then 
-    unset REMOTE_JUMP_SSH_USER
-fi
+# if [[ "$REMOTE_JUMP_SSH_USER" == "$USER" ]]; then 
+#     unset REMOTE_JUMP_SSH_USER
+# fi
 
 if [[ -z "$REMOTE_JUMP_SSH_HOST" || -z "$REMOTE_JUMP_SSH_PORT" ]]; then
     echo "Error: SSH host '$REMOTE_JUMP_SSH_NAME' is not configured in ~/.ssh/config" >&2
@@ -146,36 +159,50 @@ if [[ -n "${REMOTE_JUMP_SSH_USER:-}" ]]; then
 fi
 
 # Install mosh locally if needed
-if ! install_mosh; then 
-    echo "Error: Failed to install mosh locally" >&2
+if ! plan_mosh_install 'locally'; then 
+    echo "Error: Failed to install mosh locally using '$INSTALL_COMMAND'" >&2
     exit 1
 fi
 
-# Install mosh on the jump server if needed, and obtain
-# the external IP address, favouring IPv6 over IPv4
-public_ip="$("${ssh_command[@]}" "$REMOTE_JUMP_SSH_HOST" bash <<EOF
-$(declare -f install_mosh)
-if ! install_mosh; then exit \$?; fi
+# Install mosh on the jump server if needed, then obtain
+# the external IP address of the host being jumped to via
+# SSH, favouring IPv6 over IPv4. If no jumping takes place
+# then we use the IP address used for the connection.
+# (the underlying assumption here is that, if the host is
+# accessible directly, then there should be no reason to
+# use SSH for jumping and we should connect directly -not
+# always true but a simplifying assumption in this case)
+if echo "$REMOTE_JUMP_SSH_HOST" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    public_ip="$REMOTE_JUMP_SSH_HOST"
+fi
+public_ip_alternative="$("${ssh_command[@]}" "$REMOTE_JUMP_SSH_HOST" '$SHELL' <<EOF
+$(declare -f plan_mosh_install)
+plan_mosh_install 'on the remote' || exit \$?
+eval "\$INSTALL_COMMAND" || exit \$?
 IP=\$(curl -s -6 ifconfig.me)
-if [[ -n "\$IP" ]]; then 
-    echo "\$IP"
-else 
+if [[ -z "\$IP" ]]; then 
     IP=\$(curl -s -4 ifconfig.me)
-    if [[ -n "\$IP" ]]; then 
-        echo "\$IP"
+    if [[ -z "\$IP" ]]; then 
+        exit 0
     fi
 fi
-exit 0
+echo "\$IP"
 EOF
 )"
 
 if [[ $? -ne 0 ]]; then
     echo "Error: Failed to install mosh on remote" >&2
+    printf "Please SSH into the remote and install mosh using:\n\e[1;33m%s\e[0m\n" \
+        "${public_ip_alternative//sudo -n/sudo}"
     exit 1
 fi
 
+if [[ -n "${SSH_JUMP_ARGS[*]}" && -n "$public_ip_alternative" ]]; then 
+    public_ip="$public_ip_alternative"
+fi
+
 if [[ -z "$public_ip" ]]; then 
-    echo "Error: Failed to retrieve public IP on remote" >&2
+    echo "Error: Failed to retrieve connection IP on remote" >&2
     exit 1
 fi
 
@@ -193,20 +220,22 @@ if [[ -z "${LC_CTYPE:-}" ]] || [[ "$LC_CTYPE" != *.UTF-8 && "$LC_CTYPE" != *.utf
 fi
 
 # Spin up the mosh-server on the remote
-connect_string="$(
+server_output="$(
     "${ssh_command[@]}" "$REMOTE_JUMP_SSH_HOST" \
     "mosh-server new -s \
         -p $REMOTE_JUMP_MOSH_PORTS \
         -c $(mosh-client -c) \
         -l LC_CTYPE=UTF-8 \
-        -- bash -c '
-            "$(declare -f execute_on_the_remote)"
+        -- \$SHELL -c '
+            $(declare -f execute_on_the_remote)
             execute_on_the_remote ssh$remote_args
-        ' 2>/dev/null | grep 'MOSH CONNECT'"
+        ' 2>&1"
 )"
+connect_string="$(echo "$server_output" | grep 'MOSH CONNECT')"
 
 if [[ $? -ne 0 || -z "$connect_string" ]]; then
     echo "Error: failed to spin up mosh-server on the remote '$REMOTE_JUMP_SSH_NAME'" >&2
+    printf "\e[1;2;4m%s:\e[22;24;2m %s\e[0m\n" "DETAILS" "$server_output"
     exit 1
 fi
 
@@ -217,4 +246,5 @@ read _ _ MOSH_PORT MOSH_KEY <<< "$connect_string"
 echo "Mosh will connect to $public_ip on port $MOSH_PORT"
 
 export MOSH_KEY
+set -x
 exec mosh-client $public_ip $MOSH_PORT
