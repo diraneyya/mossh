@@ -165,15 +165,8 @@ if [[ -z "$REMOTE_JUMP_SSH_HOST" || -z "$REMOTE_JUMP_SSH_PORT" ]]; then
     exit 1
 fi
 
-
-if [[ "$(uname)" == 'Darwin' ]]; then 
-    host_resolution="$(dscacheutil -q host -a name "$REMOTE_JUMP_SSH_HOST" | \
-        awk '/^ip_address:/ { printf $2 }')"
-elif getent hosts "$REMOTE_JUMP_SSH_HOST"; then 
-    host_resolution="$(getent hosts "$REMOTE_JUMP_SSH_HOST" | \
-        head -n 1 | awk '{ printf $1 }')"
-fi
-
+host_resolution="$(grep -E "^[^#]*\s+$REMOTE_JUMP_SSH_HOST(\s|$)" \
+    /etc/hosts | awk '{print $1}' | head -1)"
 if [[ -n "$host_resolution" ]]; then 
     echo "Host '$REMOTE_JUMP_SSH_HOST' resolved to '$host_resolution'"
     REMOTE_JUMP_SSH_HOST="$host_resolution"
