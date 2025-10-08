@@ -82,6 +82,19 @@ if [[ -z "$REMOTE_JUMP_SSH_NAME" ]]; then
     exit 1
 fi
 
+# if [[ $(uname) == 'Darwin' ]]; then 
+#     host_resolution="$(dscacheutil -q host -a name hostname | \
+#         awk '/^ip_address:/ { printf $2 }')"
+# elif getent hosts "$REMOTE_JUMP_SSH_HOST"; then 
+#     host_resolution="$(getent hosts "$REMOTE_JUMP_SSH_HOST" | \
+#         head -n 1 | awk '{ printf $1 }')"
+# fi
+
+# if [[ -n "$host_resolution" ]]; then 
+#     echo "Host '$REMOTE_JUMP_SSH_HOST' resolved to '$host_resolution'"
+#     REMOTE_JUMP_SSH_HOST="$host_resolution"
+# fi
+
 # Remote functions
 function plan_mosh_install() {
     if command -v mosh-server >/dev/null 2>&1; then
@@ -150,6 +163,20 @@ REMOTE_JUMP_SSH_USER=$(ssh -G "$REMOTE_JUMP_SSH_NAME" | awk '/^user / {print $2;
 if [[ -z "$REMOTE_JUMP_SSH_HOST" || -z "$REMOTE_JUMP_SSH_PORT" ]]; then
     echo "Error: SSH host '$REMOTE_JUMP_SSH_NAME' is not configured in ~/.ssh/config" >&2
     exit 1
+fi
+
+
+if [[ "$(uname)" == 'Darwin' ]]; then 
+    host_resolution="$(dscacheutil -q host -a name "$REMOTE_JUMP_SSH_HOST" | \
+        awk '/^ip_address:/ { printf $2 }')"
+elif getent hosts "$REMOTE_JUMP_SSH_HOST"; then 
+    host_resolution="$(getent hosts "$REMOTE_JUMP_SSH_HOST" | \
+        head -n 1 | awk '{ printf $1 }')"
+fi
+
+if [[ -n "$host_resolution" ]]; then 
+    echo "Host '$REMOTE_JUMP_SSH_HOST' resolved to '$host_resolution'"
+    REMOTE_JUMP_SSH_HOST="$host_resolution"
 fi
 
 # Build SSH command array
