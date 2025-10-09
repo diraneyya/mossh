@@ -82,38 +82,36 @@ if [[ -z "$REMOTE_JUMP_SSH_NAME" ]]; then
     exit 1
 fi
 
-# if [[ $(uname) == 'Darwin' ]]; then 
-#     host_resolution="$(dscacheutil -q host -a name hostname | \
-#         awk '/^ip_address:/ { printf $2 }')"
-# elif getent hosts "$REMOTE_JUMP_SSH_HOST"; then 
-#     host_resolution="$(getent hosts "$REMOTE_JUMP_SSH_HOST" | \
-#         head -n 1 | awk '{ printf $1 }')"
-# fi
-
-# if [[ -n "$host_resolution" ]]; then 
-#     echo "Host '$REMOTE_JUMP_SSH_HOST' resolved to '$host_resolution'"
-#     REMOTE_JUMP_SSH_HOST="$host_resolution"
-# fi
-
 # Remote functions
-function plan_mosh_install() {
+plan_mosh_install() {
     if command -v mosh-server >/dev/null 2>&1; then
         return 0
     fi
 
+    # Interactivity flag, when called without an argument
+    # the assumption is that interactive invocation of sudo
+    # will be allowed, which means that the INSTALL_COMMAND
+    # will have to be executed using `ssh -t` (for granting
+    # a TTY)
+    if [ -n "$2" ]; then 
+        sudo="sudo -n"
+    else 
+        sudo="sudo"
+    fi
+
     if command -v apt-get >/dev/null 2>&1; then
-        INSTALL_COMMAND='sudo -n apt-get update && sudo -n apt-get install -y mosh'
+        INSTALL_COMMAND="$sudo apt-get update && $sudo apt-get install -y mosh"
     elif command -v yum >/dev/null 2>&1; then
-        INSTALL_COMMAND='sudo -n yum install -y mosh'
+        INSTALL_COMMAND="$sudo yum install -y mosh"
     elif command -v dnf >/dev/null 2>&1; then
-        INSTALL_COMMAND='sudo -n dnf install -y mosh'
+        INSTALL_COMMAND="$sudo dnf install -y mosh"
     elif command -v pacman >/dev/null 2>&1; then
-        INSTALL_COMMAND='sudo -n pacman -S --noconfirm mosh'
+        INSTALL_COMMAND="$sudo pacman -S --noconfirm mosh"
     elif command -v brew >/dev/null 2>&1; then
-        INSTALL_COMMAND='brew install mosh'
+        INSTALL_COMMAND="brew install mosh"
     # OpenWRT
     elif command -v opkg >/dev/null 2>&1; then
-        INSTALL_COMMAND='opkg update && opkg install mosh-server'
+        INSTALL_COMMAND="opkg update && opkg install mosh-server"
     else
         echo "No package manager(s) found $1"
         return 1
@@ -184,6 +182,49 @@ if ! plan_mosh_install 'locally'; then
     exit 1
 fi
 
+# Verify basic SSH connectivity to the (jump) remote and
+# use the LocalCommand option to indirectly resolve hosts
+# (a better alternative to accessing /etc/hosts)
+rm /tmp/mossh.host 2>/dev/null
+public_ip_alternative="$( \
+    "${ssh_command[@]}" -T \
+    -o PermitLocalCommand=yes \
+    -o LocalCommand='echo -n "%h" > /tmp/mossh.host' \
+    "$REMOTE_JUMP_SSH_HOST" '
+        if command -v curl 2>/dev/null 1>&2; then 
+            IP="$(curl -s -6 ifconfig.me)"
+            if [[ -z "$IP" ]]; then 
+                IP="$(curl -s -4 ifconfig.me)"
+                if [[ -z "$IP" ]]; then 
+                    exit 0
+                fi
+            fi
+            echo "$IP"
+        fi
+    '
+)"
+
+if [[ $? -ne 0 ]]; then
+    echo "Error: '$REMOTE_JUMP_SSH_HOST' unknown or in-accessible via SSH" >&2
+    rm /tmp/mossh.host 2>/dev/null
+    exit 1
+fi
+
+if [[ -n "$public_ip_alternative" && \
+    "$REMOTE_JUMP_SSH_HOST" != "$public_ip_alternative" ]]; then
+    echo "Host '$REMOTE_JUMP_SSH_HOST' has the public IP $public_ip_alternative"
+fi
+
+if [[ -f '/tmp/mossh.host' ]]; then
+    resolved_hostname="$(cat /tmp/mossh.host)"
+    if [[ "$resolved_hostname" != "$REMOTE_JUMP_SSH_HOST" ]]; then 
+        echo "Host '$REMOTE_JUMP_SSH_HOST' resolved to '$resolved_hostname'"
+        REMOTE_JUMP_SSH_HOST="$resolved_hostname"
+    fi
+fi
+
+rm /tmp/mossh.host 2>/dev/null
+
 # Install mosh on the jump server if needed, then obtain
 # the external IP address of the host being jumped to via
 # SSH, favouring IPv6 over IPv4. If no jumping takes place
@@ -195,27 +236,47 @@ fi
 if echo "$REMOTE_JUMP_SSH_HOST" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
     public_ip="$REMOTE_JUMP_SSH_HOST"
 fi
-public_ip_alternative="$("${ssh_command[@]}" "$REMOTE_JUMP_SSH_HOST" '$SHELL' <<EOF
-$(declare -f plan_mosh_install)
-plan_mosh_install 'on the remote' || exit \$?
-eval "\$INSTALL_COMMAND" || exit \$?
-IP=\$(curl -s -6 ifconfig.me)
-if [[ -z "\$IP" ]]; then 
-    IP=\$(curl -s -4 ifconfig.me)
-    if [[ -z "\$IP" ]]; then 
-        exit 0
-    fi
-fi
-echo "\$IP"
-EOF
-)"
+
+# Not perfect and you can face issues if you use '#' inside
+# of a string for example
+serialized_function="$( \
+    echo -n "$(declare -f plan_mosh_install)" | \
+    sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d')"
+
+output_fifo='/tmp/mossh.install_output_fifo'
+output_file='/tmp/mossh.install_output_file'
+
+rm "$output_fifo" 2>/dev/null
+rm "$output_file" 2>/dev/null
+
+mkfifo "$output_fifo"
+
+while read -d ' ' word; do 
+    printf "\e[32m%s \e[0m\e[0K" "$word"
+    echo -n "$word " >> "$output_file" 
+done < "$output_fifo" &
+
+"${ssh_command[@]}" -t \
+    "$REMOTE_JUMP_SSH_HOST" "
+    $serialized_function
+    plan_mosh_install 'on the remote' || exit \$?
+    INSTALL_COMMAND=\"\$(echo \"\$INSTALL_COMMAND\" | \
+        sed 's/sudo/sudo -p \"[%H] password for %U: \"/')\"
+    eval \"\$INSTALL_COMMAND\" || exit \$?
+    " 1>"$output_fifo" 2>/dev/null
 
 if [[ $? -ne 0 ]]; then
-    echo "Error: Failed to install mosh on remote" >&2
-    printf "Please SSH into the remote and install mosh using:\n\e[1;33m%s\e[0m\n" \
-        "${public_ip_alternative//sudo -n/sudo}"
+    printf "\r\e[0K\e[31mError: Failed to install mosh on remote\e[0m\e[0K\n" >&2
+    printf "\rPlease SSH into the remote and install mosh using:\n"
+    printf "\e[1;33m%s\e[0m\n" "$(head -n 1 "$output_file")"
+
+    rm "$output_fifo" 2>/dev/null
+    rm "$output_file" 2>/dev/null
     exit 1
 fi
+
+rm "$output_fifo" 2>/dev/null
+rm "$output_file" 2>/dev/null
 
 if [[ -n "${SSH_JUMP_ARGS[*]}" && -n "$public_ip_alternative" ]]; then 
     public_ip="$public_ip_alternative"
