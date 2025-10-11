@@ -21,6 +21,9 @@ Arguments:
 Options:
   -p <ports>    UDP port range for Mosh (default: 60001:60008)
                 Can be a single port (60010) or range (60010:60020)
+  --remember-user
+  --forget-user Allows you to configure a user to be used when
+                connecting to the same host via mossh
   -h, --help    Show this help message
 
 Examples:
@@ -61,6 +64,16 @@ while [[ $# -gt 0 ]]; do
             fi
             REMOTE_JUMP_MOSH_PORTS="$2"
             shift 2
+            ;;
+        --remember-user)
+            DELETE_USER=
+            SAVE_USER=1
+            shift
+            ;;
+        --forget-user)
+            SAVE_USER=
+            DELETE_USER=1
+            shift
             ;;
         -*)
             echo "Error: Unknown option: $1" >&2
@@ -163,12 +176,77 @@ if [[ -z "$REMOTE_JUMP_SSH_HOST" || -z "$REMOTE_JUMP_SSH_PORT" ]]; then
     exit 1
 fi
 
+# Host resolution from hosts file
 host_resolution="$(grep -E "^[^#]*\s+$REMOTE_JUMP_SSH_HOST(\s|$)" \
     /etc/hosts | awk '{print $1}' | head -1)"
 if [[ -n "$host_resolution" ]]; then 
     echo "Host '$REMOTE_JUMP_SSH_HOST' resolved to '$host_resolution'"
     REMOTE_JUMP_SSH_HOST="$host_resolution"
 fi
+
+# CONFIGURATION MANAGEMENT
+# utils for configuraion management
+fatal() {
+    echo "$1" >&2
+    exit 1
+}
+
+hash_hostname() {
+    if [[ "${#1}" -lt 2 ]]; then fatal 'Error: hostname must be 2 or more characters long.'; fi
+    echo -n "$1" | sha256sum | head -c 24
+}
+
+# Load configuration file from user's home directory
+declare -A mossh_config;
+if [[ -f "$HOME/.config/mossh.config" ]]; then     
+    while read -r -d $'\0' field; do 
+        if [ -z "$field" ]; then 
+            if [ -n "${record[*]}" ]; then 
+                read -r -d $'\0' hash user <<< "${record[*]}"
+                mossh_config[$hash]=$user
+            fi
+            record=()
+        elif [ -z "${record[*]}" ]; then 
+            record=("$field")
+        else record+=("$field")
+        fi    
+    done < "$HOME/.config/mossh.config"
+fi
+
+# Update configuration in memory if needed
+REMOTE_JUMP_SSH_HOST_HASH="$(hash_hostname "$REMOTE_JUMP_SSH_HOST")"
+
+if [[ -n "$DELETE_USER" ]]; then 
+    if [[ -n "${mossh_config[$REMOTE_JUMP_SSH_HOST_HASH]}" ]]; then
+        echo "User '$REMOTE_JUMP_SSH_USER' will be un-remembered by mossh"
+        unset mossh_config[$REMOTE_JUMP_SSH_HOST_HASH]
+    fi
+elif [[ -n "$SAVE_USER" ]]; then
+    if [[ "${mossh_config[$REMOTE_JUMP_SSH_HOST_HASH]}" != "$REMOTE_JUMP_SSH_USER" ]]; then 
+        echo "User '$REMOTE_JUMP_SSH_USER' will be remembered by mossh"
+        mossh_config[$REMOTE_JUMP_SSH_HOST_HASH]="$REMOTE_JUMP_SSH_USER"
+    fi
+elif [[ "${mossh_config[$REMOTE_JUMP_SSH_HOST_HASH]}" != "$REMOTE_JUMP_SSH_USER" ]]; then
+    if echo "$REMOTE_JUMP_SSH_NAME" | grep '@'; then 
+        echo -n "Remembered user '${mossh_config[$REMOTE_JUMP_SSH_HOST_HASH]}' "
+        echo "was not applied by mossh."
+    else
+        echo -n "Remembered user '${mossh_config[$REMOTE_JUMP_SSH_HOST_HASH]}' "
+        echo "was applied instead of SSH-configured user '$REMOTE_JUMP_SSH_USER'"
+        REMOTE_JUMP_SSH_USER="${mossh_config[$REMOTE_JUMP_SSH_HOST_HASH]}"
+    fi
+fi
+
+# Generate new configuration
+rm "$HOME/.config/mossh.config.new" 2>/dev/null
+touch "$HOME/.config/mossh.config.new"
+for hash in "${!mossh_config[@]}"; do
+    printf "%s\0%s\0\0" "$hash" "${mossh_config[$hash]}" >> "$HOME/.config/mossh.config.new";
+done
+
+# Replace configuration with new configuration
+rm "$HOME/.config/mossh.config" 2>/dev/null
+mv "$HOME/.config/mossh.config.new" "$HOME/.config/mossh.config"
 
 # Build SSH command array
 ssh_command=("ssh" "-p" "$REMOTE_JUMP_SSH_PORT")
@@ -251,7 +329,7 @@ rm "$output_file" 2>/dev/null
 
 mkfifo "$output_fifo"
 
-while read -d ' ' word; do 
+while read -r -d ' ' word; do 
     printf "\e[32m%s \e[0m\e[0K" "$word"
     echo -n "$word " >> "$output_file" 
 done < "$output_fifo" &
@@ -321,11 +399,11 @@ if [[ $? -ne 0 || -z "$connect_string" ]]; then
 fi
 
 # Read connection parameters, which will be used by the client
-read _ _ MOSH_PORT MOSH_KEY <<< "$connect_string"
+read -r _ _ MOSH_PORT MOSH_KEY <<< "$connect_string"
 
 # Invoke the client
 echo "Mosh will connect to $public_ip on port $MOSH_PORT"
 
 export MOSH_KEY
 set -x
-exec mosh-client $public_ip $MOSH_PORT
+exec mosh-client "$public_ip" "$MOSH_PORT"
